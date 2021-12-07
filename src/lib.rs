@@ -1,325 +1,97 @@
-/// A library for parsing Fountain markdown.
+mod markup;
+mod parsing;
+mod reading;
+mod util;
 
 #[cfg(test)]
 mod tests;
 
-mod internal_span;
-mod parser;
+pub use markup::*;
 
-use std::string::ToString;
+use parsing::{parse_file, parse_reader, parse_str, IntElement};
 
-use internal_span::IntSpan;
+use std::fs::File;
+use std::io;
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct Doc {
-    text_content: String,
-    spans: Vec<IntSpan>,
+pub struct Document {
+    text: String,
+    markup: Vec<IntElement>,
 }
 
-/// Represents a Fountain document
-impl Doc {
+impl Document {
     pub fn new() -> Self {
-        Doc {
-            /// Unaltered text content
-            text_content: String::new(),
-            /// Metadata over slices of text
-            spans: parser::parse(""),
+        Document {
+            text: String::new(),
+            markup: Vec::new(),
         }
     }
 
-    pub fn from_string(string: String) -> Self {
-        let spans = parser::parse(&string);
-        Doc {
-            text_content: string,
-            spans: spans,
-        }
+    pub fn from_file(file: File) -> io::Result<Self> {
+        let (markup, text) = parse_file(file)?;
+
+        Ok(Document { text, markup })
     }
 
-    fn int_spans(&self) -> impl Iterator<Item = &IntSpan> {
-        self.spans.iter()
-    }
-
-    pub fn spans(&self) -> impl Iterator<Item = Span> {
-        self.spans.iter().map(move |int_sp| Span {
-            play: self,
-            int_span: int_sp,
-        })
-    }
-
-    /// Get all spans that represent elements
-    /// (action, header, character, dialogue, etc...)
-    pub fn elements(&self) -> impl Iterator<Item = Element> {
-        self.to_elements(self.int_spans().filter(IntSpan::is_element))
-    }
-
-    fn to_elements<'a>(
-        &'a self,
-        int_spans: impl Iterator<Item = &'a IntSpan>,
-    ) -> impl Iterator<Item = Element> {
-        int_spans.map(move |span| Element {
-            play: self,
-            int_span: span,
-        })
-    }
-
-    /*
-    fn int_span_str(&self, span: &IntSpan) -> &str {
-        span.str_from(&self.text_content)
-    }
-    */
-
-    pub fn range(&self, index: usize, length: usize) -> impl Iterator<Item = &IntSpan> {
-        let beg = index;
-        let end = index + length;
-
-        self.spans
-            .iter()
-            .filter(move |span| span.index >= beg && span.index + span.length <= end)
-    }
-}
-
-impl ToString for Doc {
-    fn to_string(&self) -> String {
-        self.text_content.clone()
-    }
-}
-
-impl SpanLike for Doc {
-    fn doc(&self) -> &Doc {
-        &self
-    }
-
-    fn ind(&self) -> usize {
-        0
-    }
-
-    fn len(&self) -> usize {
-        self.text_content.len()
-    }
-
-    fn span(&self) -> Span {
-        Span {
-            play: self,
-            int_span: &self.spans[0],
-        }
-    }
-
-    fn span_type(&self) -> SpanType {
-        SpanType::Doc
-    }
-}
-
-pub trait SpanLike: Sized {
-    fn doc(&self) -> &Doc;
-    //fn doc_mut(&mut self) -> &mut Doc;
-
-    fn ind(&self) -> usize;
-    fn len(&self) -> usize;
-
-    fn as_str(&self) -> &str {
-        self.doc()
-            .text_content
-            .get(self.ind()..self.ind() + self.len())
-            .unwrap()
-    }
-
-    fn span_type(&self) -> SpanType;
-
-    fn positions(&self) -> Positions<Self> {
-        Positions {
-            span: self,
-            index: 0,
-        }
-    }
-
-    fn span(&self) -> Span;
-
-    unsafe fn char_at(&self, index: usize) -> char {
-        self.doc().text_content[self.ind() + index..]
-            .chars()
-            .next()
-            .unwrap()
-    }
-
-    /*
-    fn style<'a, I>(&self) -> I
+    pub fn from_reader<R>(reader: R) -> io::Result<Self>
     where
-        I: Iterator<Item = Span<'a>>,
+        R: io::Read,
     {
-        self.doc().range(self.ind(), self.len()).map(|s| AnySpan {
-            play: self.doc(),
-            _span: s,
-        })
+        let (markup, text) = parse_reader(reader)?;
+
+        Ok(Document { text, markup })
     }
-    */
+
+    pub fn elements(&self) -> Elements {
+        Elements::new(self, 0, self.markup.len())
+    }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct Position<'a, S>
+impl<S> From<S> for Document
 where
-    S: SpanLike + 'a,
+    S: Into<String>,
 {
-    span: &'a S,
+    fn from(text: S) -> Self {
+        let text = text.into();
+        let markup = parse_str(&text, 0);
+
+        Document { text, markup }
+    }
+}
+
+pub struct Elements<'d> {
+    doc: &'d Document,
     index: usize,
+    limit: usize,
 }
 
-impl<'a, S> Position<'a, S>
-where
-    S: SpanLike + 'a,
-{
-    pub fn char(&self) -> char {
-        unsafe { self.char_at(0) }
+impl<'d> Elements<'d> {
+    pub fn new(doc: &'d Document, start: usize, end: usize) -> Self {
+        Self {
+            doc,
+            index: start,
+            limit: end,
+        }
     }
-}
+    fn element_from_internal(&self, int_elm: &IntElement) -> Element<'d> {
+        let text = unsafe { self.doc.text.get_unchecked(int_elm.start..=int_elm.end) };
 
-impl<'a, S> SpanLike for Position<'a, S>
-where
-    S: SpanLike + 'a,
-{
-    fn ind(&self) -> usize {
-        self.index
-    }
-
-    fn len(&self) -> usize {
-        self.span.len()
-    }
-
-    fn span(&self) -> Span {
-        self.span.span()
-    }
-
-    fn span_type(&self) -> SpanType {
-        self.span.span_type()
-    }
-
-    fn doc(&self) -> &Doc {
-        self.span.doc()
+        Element::new(int_elm.start, int_elm.elm_type, text)
     }
 }
 
-pub struct Positions<'a, S>
-where
-    S: SpanLike + 'a,
-{
-    span: &'a S,
-    index: usize,
-}
+impl<'d> Iterator for Elements<'d> {
+    type Item = Element<'d>;
 
-impl<'a, S> Iterator for Positions<'a, S>
-where
-    S: SpanLike + 'a,
-{
-    type Item = Position<'a, S>;
-
-    fn next(&mut self) -> Option<Position<'a, S>> {
-        if self.index < self.span.len() {
-            let pos = Position {
-                span: self.span,
-                index: self.index,
-            };
-
-            let charlen = unsafe { self.span.char_at(self.index).len_utf8() };
-            self.index += charlen;
-
-            Some(pos)
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.limit {
+            let i = self.index;
+            self.index += 1;
+            self.doc
+                .markup
+                .get(i)
+                .map(|int_elm| self.element_from_internal(int_elm))
         } else {
             None
         }
     }
-}
-
-/*
-impl ToString for Span {
-    fn to_string(&self) -> String {
-        self.as_str().to_string()
-    }
-}
-*/
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub enum SpanType {
-    Doc,
-    Line,
-    Element(ElmType),
-    Note,
-    Boneyard,
-    Emphasis(u8),
-    Underline,
-}
-
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
-pub struct Span<'a> {
-    play: &'a Doc,
-    int_span: &'a IntSpan,
-}
-
-impl<'a> SpanLike for Span<'a> {
-    fn doc(&self) -> &Doc {
-        &self.play
-    }
-
-    fn ind(&self) -> usize {
-        self.int_span.index
-    }
-    fn len(&self) -> usize {
-        self.int_span.length
-    }
-
-    fn span(&self) -> Span {
-        self.clone()
-    }
-
-    fn span_type(&self) -> SpanType {
-        self.int_span.stype
-    }
-}
-
-/// Represents a span over an element
-#[derive(Debug, Eq, PartialEq)]
-pub struct Element<'a> {
-    play: &'a Doc,
-    int_span: &'a IntSpan,
-}
-
-impl<'a> Element<'a> {
-    pub fn elm_type(&self) -> ElmType {
-        self.int_span.elm_type()
-    }
-}
-
-impl<'a> SpanLike for Element<'a> {
-    fn doc(&self) -> &Doc {
-        &self.play
-    }
-
-    fn ind(&self) -> usize {
-        self.int_span.index
-    }
-    fn len(&self) -> usize {
-        self.int_span.length
-    }
-
-    fn span(&self) -> Span {
-        Span {
-            play: self.doc(),
-            int_span: self.int_span,
-        }
-    }
-
-    fn span_type(&self) -> SpanType {
-        self.int_span.stype
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
-pub enum ElmType {
-    Action,
-    Heading,
-    Character,
-    Parenthetical,
-    Dialogue,
-    Transition,
-    PageBreak,
-    Lyric,
-    Centered,
 }
